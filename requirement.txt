@@ -1,6 +1,6 @@
 streamlit
 pandas
 numpy
-prophet
+prophet==1.1
 cmdstanpy
 scipy
