@@ -1,8 +1,30 @@
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.stats import norm
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+# ---------------------------------------------------
+# Helper: approximate normal inverse CDF (ppf)
+# ---------------------------------------------------
+
+def normal_ppf(p: float) -> float:
+    """
+    Approximate inverse CDF of standard normal using binary search on erf-based CDF.
+    Works fine for 0.8 <= p <= 0.999 for our inventory purposes.
+    """
+    # Standard normal CDF using erf
+    def cdf(z: float) -> float:
+        return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    lo, hi = -5.0, 5.0
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        if cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
 
 # ---------------------------------------------------
 # Data loading
@@ -11,15 +33,15 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 @st.cache_data
 def load_data(csv_path: str = "Walmart.csv") -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # Dates are in DD-MM-YYYY format in your file
+    # Dates in DD-MM-YYYY format
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
     return df
 
 
 def build_store_df(df: pd.DataFrame, store_id: int, product_price: float) -> pd.DataFrame:
     """
-    Convert Weekly_Sales to product units for a specific store.
-    Assumes all sales are from the chosen product with given unit price.
+    Convert Weekly_Sales (dollars) -> Units_Sold for a specific store,
+    assuming all sales come from the chosen product with given unit price.
     """
     df = df.copy()
     df["Units_Sold"] = df["Weekly_Sales"] / product_price
@@ -28,22 +50,21 @@ def build_store_df(df: pd.DataFrame, store_id: int, product_price: float) -> pd.
     store_df = store_df.sort_values("ds")
     return store_df
 
-
 # ---------------------------------------------------
-# Forecasting (Exponential Smoothing instead of Prophet)
+# Forecasting with Exponential Smoothing
 # ---------------------------------------------------
 
 def run_forecast(store_df: pd.DataFrame, horizon_weeks: int):
     """
     Fit an Exponential Smoothing model and return:
-    - historical fitted values
-    - future forecast values
+    - hist_df: fitted historical values
+    - future_df: future forecast values
     Both as dataframes with columns: ['ds', 'yhat'].
     """
     ts = store_df.set_index("ds")["y"].asfreq("W")
     ts = ts.sort_index()
 
-    # Basic additive trend + seasonal model with yearly seasonality (52 weeks)
+    # Basic additive trend + additive seasonality (52-week seasonality)
     model = ExponentialSmoothing(
         ts,
         trend="add",
@@ -67,7 +88,6 @@ def run_forecast(store_df: pd.DataFrame, horizon_weeks: int):
 
     return hist_df, future_df
 
-
 # ---------------------------------------------------
 # Inventory calculations
 # ---------------------------------------------------
@@ -88,12 +108,12 @@ def inventory_calculations(
     mu = forecast_future["yhat"].mean()      # mean weekly demand (units)
     sigma = forecast_future["yhat"].std()    # std dev weekly demand (units)
 
-    # Convert service level (e.g. 95) to Z using normal quantile
-    Z = norm.ppf(service_level / 100.0)
+    # Convert service level (e.g. 95 -> 0.95) to Z using our normal_ppf
+    Z = normal_ppf(service_level / 100.0)
 
     # Demand during lead time
     mu_L = mu * lead_time_weeks
-    sigma_L = sigma * np.sqrt(lead_time_weeks)
+    sigma_L = sigma * math.sqrt(lead_time_weeks)
 
     # Safety stock & ROP
     safety_stock = Z * sigma_L
@@ -101,12 +121,12 @@ def inventory_calculations(
 
     # Economic Order Quantity (EOQ)
     annual_demand_units = mu * 52  # approximate
-    EOQ = np.sqrt((2 * annual_demand_units * order_cost) / holding_cost)
+    EOQ = math.sqrt((2 * annual_demand_units * order_cost) / holding_cost)
 
     # Monte Carlo simulation of demand during lead time
     simulated_demand = np.random.normal(mu_L, sigma_L, num_sims)
     current_inventory = rop  # assume we hold inventory at ROP for risk calc
-    stockout_prob = np.mean(simulated_demand > current_inventory)
+    stockout_prob = float((simulated_demand > current_inventory).mean())
 
     results = {
         "mu": mu,
@@ -122,7 +142,6 @@ def inventory_calculations(
     }
     return results
 
-
 # ---------------------------------------------------
 # Streamlit App
 # ---------------------------------------------------
@@ -134,7 +153,7 @@ st.write(
     """
     This app uses **Walmart weekly sales data** and assumes a single product
     (e.g., **bottled water**) with an average unit price to:
-    - Forecast weekly demand using **Exponential Smoothing**
+    - Forecast weekly demand (Exponential Smoothing)
     - Compute **Safety Stock, Reorder Point (ROP), EOQ**
     - Estimate **stockout probability** via Monte Carlo simulation
     """
@@ -251,7 +270,7 @@ else:
             st.metric("Current inventory (assumed = ROP)", f"{current_inventory:,.2f} units")
             st.metric("Stockout probability", f"{stockout_prob * 100:.2f}%")
 
-        # Interpretation block (clean & friendly)
+        # Interpretation
         st.subheader("🧾 Interpretation (Clear & Simple)")
         st.write(
             f"""
