@@ -1,11 +1,11 @@
 import numpy as np
 import pandas as pd
 import streamlit as st
-from prophet import Prophet
 from scipy.stats import norm
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 # ---------------------------------------------------
-# Helpers
+# Data loading
 # ---------------------------------------------------
 
 @st.cache_data
@@ -29,20 +29,51 @@ def build_store_df(df: pd.DataFrame, store_id: int, product_price: float) -> pd.
     return store_df
 
 
-def run_forecast(store_df: pd.DataFrame, horizon_weeks: int) -> pd.DataFrame:
-    """
-    Fit Prophet and return forecast dataframe.
-    """
-    model = Prophet(weekly_seasonality=True, yearly_seasonality=True)
-    model.fit(store_df)
+# ---------------------------------------------------
+# Forecasting (Exponential Smoothing instead of Prophet)
+# ---------------------------------------------------
 
-    future = model.make_future_dataframe(periods=horizon_weeks, freq="W")
-    forecast = model.predict(future)
-    return forecast
+def run_forecast(store_df: pd.DataFrame, horizon_weeks: int):
+    """
+    Fit an Exponential Smoothing model and return:
+    - historical fitted values
+    - future forecast values
+    Both as dataframes with columns: ['ds', 'yhat'].
+    """
+    ts = store_df.set_index("ds")["y"].asfreq("W")
+    ts = ts.sort_index()
 
+    # Basic additive trend + seasonal model with yearly seasonality (52 weeks)
+    model = ExponentialSmoothing(
+        ts,
+        trend="add",
+        seasonal="add",
+        seasonal_periods=52,
+        initialization_method="estimated",
+    ).fit()
+
+    # Fitted (historical)
+    fitted = model.fittedvalues
+    hist_df = pd.DataFrame({"ds": fitted.index, "yhat": fitted.values})
+
+    # Future forecast
+    future_index = pd.date_range(
+        start=ts.index[-1] + pd.Timedelta(weeks=1),
+        periods=horizon_weeks,
+        freq="W",
+    )
+    future_forecast = model.forecast(horizon_weeks)
+    future_df = pd.DataFrame({"ds": future_index, "yhat": future_forecast.values})
+
+    return hist_df, future_df
+
+
+# ---------------------------------------------------
+# Inventory calculations
+# ---------------------------------------------------
 
 def inventory_calculations(
-    forecast: pd.DataFrame,
+    forecast_future: pd.DataFrame,
     horizon_weeks: int,
     service_level: float,
     lead_time_weeks: int,
@@ -54,17 +85,14 @@ def inventory_calculations(
     Compute μ, σ from forecast horizon, then SS, ROP, EOQ and stockout probability.
     All in product UNITS.
     """
-    forecast_future = forecast.tail(horizon_weeks)
     mu = forecast_future["yhat"].mean()      # mean weekly demand (units)
     sigma = forecast_future["yhat"].std()    # std dev weekly demand (units)
 
     # Convert service level (e.g. 95) to Z using normal quantile
     Z = norm.ppf(service_level / 100.0)
 
-    # Lead time demand
+    # Demand during lead time
     mu_L = mu * lead_time_weeks
-
-    # For multiple weeks of lead time: sigma_L = sigma * sqrt(L)
     sigma_L = sigma * np.sqrt(lead_time_weeks)
 
     # Safety stock & ROP
@@ -106,7 +134,7 @@ st.write(
     """
     This app uses **Walmart weekly sales data** and assumes a single product
     (e.g., **bottled water**) with an average unit price to:
-    - Forecast weekly demand using **Prophet**
+    - Forecast weekly demand using **Exponential Smoothing**
     - Compute **Safety Stock, Reorder Point (ROP), EOQ**
     - Estimate **stockout probability** via Monte Carlo simulation
     """
@@ -174,18 +202,17 @@ else:
             st.line_chart(store_df.set_index("ds")["y"])
 
         # Forecast
-        forecast = run_forecast(store_df, horizon_weeks=forecast_horizon_weeks)
+        hist_df, future_df = run_forecast(store_df, horizon_weeks=forecast_horizon_weeks)
 
         with col_left:
-            st.subheader("🔮 Forecasted Weekly Demand (Prophet)")
-
-            forecast_plot_df = forecast[["ds", "yhat"]].copy()
-            forecast_plot_df = forecast_plot_df.set_index("ds")
-            st.line_chart(forecast_plot_df)
+            st.subheader("🔮 Forecasted Weekly Demand (Exponential Smoothing)")
+            plot_df = pd.concat([hist_df, future_df], ignore_index=True)
+            plot_df = plot_df.set_index("ds")
+            st.line_chart(plot_df["yhat"])
 
         # Inventory calculations
         results = inventory_calculations(
-            forecast=forecast,
+            forecast_future=future_df,
             horizon_weeks=forecast_horizon_weeks,
             service_level=service_level,
             lead_time_weeks=lead_time_weeks,
@@ -224,38 +251,36 @@ else:
             st.metric("Current inventory (assumed = ROP)", f"{current_inventory:,.2f} units")
             st.metric("Stockout probability", f"{stockout_prob * 100:.2f}%")
 
-st.subheader("🧾 Interpretation (Clear & Simple)")
+        # Interpretation block (clean & friendly)
+        st.subheader("🧾 Interpretation (Clear & Simple)")
+        st.write(
+            f"""
+            Here’s what the numbers mean for **Store {store_id}** and **{product_name}** (≈ ${product_price:.2f}/unit):
 
-st.write(
-    f"""
-    Here’s what the numbers mean for **Store {store_id}** and **{product_name}** (≈ ${product_price:.2f}/unit):
+            ### 🔹 Demand Forecast
+            - The store typically sells **{mu:,.0f} units** per week.
+            - Week-to-week demand fluctuates by about **{sigma:,.0f} units** on average.
 
-    ### 🔹 Demand Forecast
-    - The store typically sells **{mu:,.0f} units** per week.
-    - Week-to-week demand fluctuates by about **{sigma:,.0f} units** on average.
-    - This volatility comes from natural variation in customer buying behavior.
+            ### 🔹 Inventory Policy
+            Based on your target service level of **{service_level:.1f}%** and a **{lead_time_weeks}-week lead time**:
+            - You should keep about **{safety_stock:,.0f} units** as extra buffer stock (Safety Stock).
+            - You should place a new order whenever inventory falls to around **{rop:,.0f} units** (Reorder Point).
 
-    ### 🔹 Inventory Policy
-    Based on your target service level of **{service_level:.1f}%** and a **{lead_time_weeks}-week lead time**:
-    - You should keep **{safety_stock:,.0f} units** of extra stock as a buffer (Safety Stock).
-    - You should place a new order whenever inventory falls to **{rop:,.0f} units** (Reorder Point).
+            ### 🔹 Order Quantity (EOQ)
+            - Given your ordering cost (${order_cost:,.2f}) and holding cost (${holding_cost:.3f}/unit/week),
+              the most cost-efficient order size is about **{EOQ:,.0f} units**.
+            - This balances:
+                - Larger, less frequent orders (higher holding cost)
+                - Smaller, more frequent orders (higher ordering cost)
 
-    ### 🔹 Order Quantity (EOQ)
-    - Given your ordering cost (${order_cost:,.2f}) and holding cost (${holding_cost:.3f}/unit/week),
-      the most cost-efficient order size is **{EOQ:,.0f} units**.
-    - This balances:
-        - Large orders (fewer orders, but higher holding cost)
-        - Small orders (less holding cost, but more frequent ordering)
+            ### 🔹 Stockout Risk
+            - We simulated **{num_sims:,}** possible demand scenarios during the lead time.
+            - With this policy, the chance of a stockout while waiting for the next order is **{stockout_prob*100:.2f}%**.
+            - This risk is consistent with your target service level.
 
-    ### 🔹 Stockout Risk
-    - We simulated **{num_sims:,}** possible demand scenarios during the lead time.
-    - If you maintain inventory at the reorder point, the chance of a stockout is **{stockout_prob*100:.2f}%**.
-    - This risk matches your service-level target — meaning your inventory strategy is well-calibrated.
-
-    ---
-    **Bottom line:**  
-    These numbers help you decide *how much to keep on hand*, *when to reorder*, and *how much to order*  
-    so that you avoid running out of stock while minimizing inventory costs.
-    """
-)
-
+            ---
+            **Bottom line:**  
+            These numbers help you decide *how much to keep on hand*, *when to reorder*, and *how much to order*  
+            so that you avoid running out of stock while controlling inventory costs.
+            """
+        )
