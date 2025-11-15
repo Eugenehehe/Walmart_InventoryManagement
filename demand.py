@@ -96,7 +96,7 @@ def inventory_calculations(future_df, service_level, lead_time_weeks, order_cost
 # ---------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------
-st.title("📦 Inventory Optimization (Deployable Version)")
+st.title("Inventory Optimization")
 
 df = load_data("Walmart.csv")
 store_ids = sorted(df["Store"].unique())
